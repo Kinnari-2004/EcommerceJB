@@ -1,0 +1,35 @@
+import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, OneToMany, JoinColumn, CreateDateColumn } from 'typeorm';
+import { User } from './User';
+import { OrderItem } from './OrderItem';
+
+export enum PaymentMethod {
+  CREDIT_CARD = 'Credit Card',
+  DEBIT_CARD = 'Debit Card',
+  CASH_ON_DELIVERY = 'Cash on Delivery',
+  BANK_TRANSFER = 'Bank Transfer',
+}
+
+@Entity()
+export class Order {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @ManyToOne(() => User, (u) => u.orders, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'userId' })
+  user!: User;
+
+  @Column({ type: 'int' })
+  userId!: number;
+
+  @CreateDateColumn()
+  placedAt!: Date;
+
+  @Column({ type: 'varchar' })
+  paymentMethod!: PaymentMethod;
+
+  @Column({ type: 'decimal', precision: 10, scale: 2 })
+  totalAmount!: number;
+
+  @OneToMany(() => OrderItem, (i) => i.order, { cascade: true })
+  items!: OrderItem[];
+}

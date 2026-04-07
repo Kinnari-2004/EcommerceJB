@@ -1,0 +1,610 @@
+================================================================================
+  E-COMMERCE PROJECT — COMPLETE TECHNICAL DOCUMENTATION
+  For Final Evaluation | Full-Stack Node.js + Angular
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Project Overview & Architecture
+2.  Folder Structure Explained
+3.  Database Design & Entities
+4.  Authentication & Session Management
+5.  Security Implementation
+6.  Backend Layer Breakdown (Routes → Controllers → Services)
+7.  Frontend Architecture (Services → Components)
+8.  Key Features Implementation Details
+9.  Alternatives Considered
+10. Interview Questions & Answers
+
+
+================================================================================
+1. PROJECT OVERVIEW & ARCHITECTURE
+================================================================================
+
+This is a full-stack e-commerce application built with:
+  - Backend:  Node.js, Express, TypeScript, TypeORM, better-sqlite3
+  - Frontend: Angular 17 (standalone components, lazy-loaded admin module)
+  - Auth:     JWT stored in HTTP-only cookies + server-side in-memory session store
+
+The architecture follows a 3-layer pattern on the backend:
+  Request → Route → Middleware → Controller → Service → Database
+
+And a clean separation on the frontend:
+  Component → Service → HTTP → Backend API
+
+The key design decision is that Angular components NEVER call HttpClient directly.
+They only talk to Angular services. This mirrors the backend pattern where
+controllers never query the database directly — they call service functions.
+
+
+================================================================================
+2. FOLDER STRUCTURE EXPLAINED
+================================================================================
+
+BACKEND:
+  src/
+  ├── entity/          TypeORM entity classes — define DB table schemas
+  ├── service/         Business logic — DB queries, calculations, validation
+  ├── controller/      HTTP layer — parse request, call service, send response
+  ├── routes/          Express routers — map URLs to middleware + controller
+  ├── middleware/       auth.ts (requireAuth/Admin/Customer), limiter.ts (rate limiting)
+  ├── store/           sessionStore.ts — in-memory Map for active sessions
+  ├── data-source.ts   TypeORM DataSource configuration
+  ├── passport.ts      JWT strategy configuration
+  ├── index.ts         Express app setup, CORS, static files, server start
+  └── seed.ts          Seeds admin user, customer user, taxonomy, sample products
+
+FRONTEND:
+  src/app/
+  ├── core/
+  │   ├── services/    auth, product, cart, order, admin, profile services
+  │   └── guards/      authGuard, adminGuard, customerGuard, guestGuard
+  ├── pages/           All user-facing page components
+  └── admin/           Lazy-loaded admin module with its own shell layout
+
+WHY THIS STRUCTURE?
+  - Separation of concerns: each layer has one job
+  - Testability: services can be tested without HTTP context
+  - Reusability: service logic can be called from multiple controllers
+  - Maintainability: changing DB logic only requires changing the service
+
+
+================================================================================
+3. DATABASE DESIGN & ENTITIES
+================================================================================
+
+ENTITIES AND RELATIONSHIPS:
+
+  User (id, name, email, passwordHash, role, isLocked, createdAt)
+    - role: 'customer' | 'admin'
+    - isLocked: boolean — admin can lock accounts immediately
+    - One user has many CartItems and many Orders
+
+  ProductType (id, name)
+    - Top level of taxonomy: Electronics, Furniture, Stationery
+    - One type has many Categories
+
+  Category (id, name, productTypeId)
+    - Second level: Computer Peripherals, Audio, Living Room
+    - Belongs to one ProductType, has many SubCategories
+
+  SubCategory (id, name, categoryId)
+    - Third level: Keyboards, Mice, Headphones, Tables
+    - Belongs to one Category, has many Products
+
+  Product (id, name, description, price, stock, imagePath, subCategoryId, createdAt)
+    - Belongs to one SubCategory
+    - imagePath stores only the filename, not the file itself
+    - price stored as DECIMAL(10,2) for accuracy
+
+  CartItem (id, userId, productId, quantity)
+    - Junction table between User and Product
+    - Persists across sessions (stored in DB, not browser)
+    - CASCADE delete when user or product is deleted
+
+  Order (id, userId, paymentMethod, totalAmount, placedAt)
+    - paymentMethod stored as string at time of order
+
+  OrderItem (id, orderId, productId, productName, priceAtPurchase, quantity)
+    - CRITICAL: productName and priceAtPurchase are SNAPSHOTS
+    - Even if the product is deleted or price changes later,
+      the order history remains accurate
+    - productId is nullable (SET NULL) so deleting a product
+      does not delete the order history
+
+  PasswordResetCode (id, email, code, createdAt, expiresAt, used)
+    - Stores 6-digit codes for password reset flow
+    - expiresAt enforces 10-minute expiry
+    - used flag prevents code reuse
+
+WHY EXPLICIT COLUMN TYPES?
+  better-sqlite3 requires all columns to have explicit types like
+  { type: 'varchar' }, { type: 'int' }, { type: 'boolean' }.
+  PostgreSQL and MySQL can infer types from TypeScript metadata,
+  but SQLite's TypeORM driver cannot.
+
+NORMALIZATION:
+  The schema is in 3NF (Third Normal Form):
+  - No repeating groups
+  - All non-key attributes depend on the entire key
+  - No transitive dependencies
+  Price snapshots in OrderItem intentionally denormalize for historical accuracy.
+
+
+================================================================================
+4. AUTHENTICATION & SESSION MANAGEMENT
+================================================================================
+
+HOW LOGIN WORKS (step by step):
+
+  1. User POSTs email + password to /api/auth/login
+  2. Controller validates input format
+  3. Auth service queries DB for user by email
+  4. bcrypt.compare() checks password against stored hash
+  5. If account is locked, reject with 403
+  6. Generate a UUID called 'jti' (JWT ID — a unique session identifier)
+  7. Create JWT: jwt.sign({ sub: userId, jti, role }, SECRET, { expiresIn: '7d' })
+  8. Store session in memory: sessionStore.create(jti, { userId, role, ip, userAgent })
+  9. Set HTTP-only cookie containing the JWT
+  10. Return { role, name } to frontend
+ 
+HOW EVERY PROTECTED REQUEST WORKS:
+
+  1. Browser automatically sends cookie with every request
+  2. Passport JWT strategy extracts token from cookie (cookieExtractor)
+  3. JWT is verified with SECRET — if tampered, invalid
+  4. payload.jti is looked up in the in-memory sessionStore
+  5. If session not found — user was logged out — reject 401
+  6. DB query fetches fresh user data
+  7. If user.isLocked — delete session, reject 401 (IMMEDIATE LOCK)
+  8. Attach { ...user, jti } to req.user
+  9. Controller/next middleware runs
+
+WHY BOTH JWT AND SESSION STORE?
+
+  JWT alone is stateless — you cannot invalidate a token before it expires.
+  If an admin locks an account, the user could keep using their JWT for 7 days.
+
+  The session store solves this:
+  - When admin locks account → sessionStore.deleteAllForUser(userId)
+  - Next request by that user → session lookup fails → 401 immediately
+
+  This gives us the best of both worlds:
+  - JWT: self-contained, no DB query needed for basic validation
+  - Session store: immediate revocation when needed
+
+WHY HTTP-ONLY COOKIES INSTEAD OF LOCALSTORAGE?
+
+  localStorage is accessible by JavaScript, making tokens vulnerable to
+  XSS (Cross-Site Scripting) attacks. HTTP-only cookies cannot be read
+  by JavaScript at all — only the browser sends them with requests.
+
+  SameSite: 'strict' also prevents CSRF (Cross-Site Request Forgery)
+  by blocking cookies from being sent by third-party sites.
+
+FORGOT PASSWORD FLOW:
+
+  Step 1: User enters email
+    - Backend generates a random 6-digit code
+    - Saves it to PasswordResetCode table with 10-minute expiry
+    - Returns code directly on screen (mock — production would email it)
+
+  Step 2: User enters code + new password
+    - Backend finds matching unused code+
+    - Checks expiry: new Date() > entry.expiresAt → reject
+    - Updates passwordHash with new bcrypt hash
+    - Marks code as used=true (prevents reuse)
+    - Deletes all active sessions (forces re-login)
+
+CHANGE PASSWORD FLOW (logged in):
+
+  - Requires current password + new password
+  - bcrypt.compare(currentPassword, storedHash)
+  - If wrong → 401
+  - If correct → save new hash
+  - Invalidate all OTHER sessions (other devices)
+  - Current session remains valid (user stays logged in on this device)
+
+
+================================================================================
+5. SECURITY IMPLEMENTATION
+================================================================================
+
+PASSWORD HASHING:
+  bcrypt with cost factor 12.
+  bcrypt is specifically designed for passwords:
+  - Slow by design (makes brute force infeasible)
+  - Automatically generates and stores a unique salt per password
+  - Work factor can be increased as hardware improves
+  
+  Cost factor 12 means 2^12 = 4096 iterations.
+  Each hash takes ~300ms on modern hardware — slow enough to stop
+  brute force, fast enough for normal login use.
+
+  Alternative: Argon2 (winner of the Password Hashing Competition, 2015).
+  Argon2id is considered slightly more secure but bcrypt has wider ecosystem support.
+
+SQL INJECTION PREVENTION:
+  All queries use TypeORM's QueryBuilder with parameterized bindings:
+    .andWhere('product.name LIKE :term', { term })
+  
+  The { term } is a named parameter — TypeORM escapes all values before
+  passing them to SQLite. Raw string concatenation like `WHERE name = '${term}'`
+  is never used.
+
+RATE LIMITING:
+  express-rate-limit on all /api/auth/* routes:
+  - 10 requests per 15 minutes per IP
+  - Prevents brute force password attacks
+  - Returns 429 Too Many Requests when exceeded
+
+CORS:
+  Only the Angular development origin (http://localhost:4200) and the
+  production origin are whitelisted. All other origins are blocked.
+
+RBAC (Role-Based Access Control):
+  Three middleware functions enforce access:
+  - requireAuth:     any logged-in user
+  - requireCustomer: only users with role='customer'
+  - requireAdmin:    only users with role='admin'
+  
+  Admin routes are completely inaccessible to customers — even if a
+  customer somehow knows the admin URL, they get 403 Forbidden.
+
+ERROR HANDLING:
+  Global error handler in index.ts catches unhandled errors and returns:
+    { error: 'Internal server error' }
+  
+  Stack traces, database errors, and file paths are NEVER exposed to the
+  client. This prevents attackers from learning about system internals.
+
+INPUT VALIDATION:
+  - Email validated with regex before any DB query
+  - Passwords checked for minimum length
+  - All string inputs trimmed before use
+  - Number inputs parsed with parseInt/parseFloat and validated with isNaN()
+  - TypeScript strict mode catches type mismatches at compile time
+
+ACCOUNT LOCKING:
+  When admin locks an account:
+  1. user.isLocked = true saved to DB
+  2. sessionStore.deleteAllForUser(userId) called immediately
+  3. User's next request: JWT still valid, session lookup returns undefined
+  4. Passport strategy returns false → 401 Unauthorized
+  Effect is instantaneous — no delay.
+
+
+================================================================================
+6. BACKEND LAYER BREAKDOWN
+================================================================================
+
+ROUTE (src/routes/*.ts):
+  Purpose: Map HTTP methods + URLs to middleware + controller functions
+  Contains: ONLY router.get/post/patch/delete declarations
+  Does NOT: query DB, contain business logic, validate input
+
+  Example (routes/auth.ts):
+    router.post('/login', authLimiter, login);
+    router.post('/logout', requireAuth, logout);
+
+CONTROLLER (src/controller/*.ts):
+  Purpose: Handle HTTP request/response cycle
+  Contains: Input validation, calling service, sending HTTP response
+  Does NOT: query DB directly, contain business calculations
+
+  Example (controller/auth.controller.ts):
+    export const login = async (req, res) => {
+      // 1. Validate input
+      if (typeof email !== 'string') { res.status(400)... return; }
+      // 2. Call service
+      const result = await loginUser(email, password, userAgent, ip);
+      // 3. Set cookie and send response
+      res.cookie(...); res.json({ role, name });
+    };
+
+SERVICE (src/service/*.ts):
+  Purpose: Business logic and database operations
+  Contains: All TypeORM queries, calculations, business rules
+  Does NOT: know about HTTP, req, res, cookies
+
+  Example (service/auth.service.ts):
+    export async function loginUser(email, password, userAgent, ip) {
+      const user = await repo.findOneBy({ email });
+      if (!user || !bcrypt.compare(password, user.passwordHash))
+        throw Object.assign(new Error('Invalid credentials'), { status: 401 });
+      const jti = randomUUID();
+      const token = jwt.sign(...);
+      sessionStore.create(jti, { userId, ... });
+      return { token, cookieName, role, name };
+    }
+
+WHY THIS SEPARATION?
+  - If you switch from SQLite to PostgreSQL, only service files change
+  - If you want to test business logic, you can call service functions
+    directly without setting up an HTTP server
+  - Multiple controllers could reuse the same service function
+  - Clear responsibility: route = routing, controller = HTTP, service = logic
+
+
+================================================================================
+7. FRONTEND ARCHITECTURE
+================================================================================
+
+ANGULAR SERVICES (src/app/core/services/):
+  Each service owns all HTTP calls for its domain:
+
+  AuthService:    login, logout, register, forgotPassword, resetPassword, init()
+  ProductService: getProducts (with filters), getFeatured, getProduct, getTaxonomy
+  CartService:    load, add, updateQty, remove, clear (uses Angular signals)
+  OrderService:   checkout, getOrders, getOrder
+  ProfileService: getProfile, updateProfile
+  AdminService:   CRUD for products, getCustomers, setLock, getOrders
+
+  AuthService uses Angular signals:
+    private _user = signal<AuthUser | null>(null);
+    readonly user = this._user.asReadonly();
+  
+  This means any component can reactively read auth state without subscribing.
+
+ROUTE GUARDS (src/app/core/guards/auth.guard.ts):
+  authGuard:     must be logged in → else redirect /login
+  customerGuard: must be customer → else redirect /login or /
+  adminGuard:    must be admin → else redirect /login
+  guestGuard:    must be NOT logged in → else redirect / or /admin
+
+APP_INITIALIZER:
+  Before the Angular app renders, it calls auth.init() which hits /api/auth/me.
+  If the user has a valid cookie, it returns their profile and populates _user.
+  If not, it fails silently (catchError → of(null)).
+  This restores auth state on page refresh without a visible flash.
+
+LAZY LOADING:
+  The admin module is lazy-loaded:
+    { path: 'admin', loadChildren: () => import('./admin/admin.routes') }
+  
+  This means admin code is NOT downloaded by customers or guests.
+  The admin bundle is only fetched when someone navigates to /admin.
+  This improves initial load performance.
+
+STANDALONE COMPONENTS:
+  All components use standalone: true with explicit imports array.
+  No NgModules are used. This is the Angular 17 recommended approach.
+  Each component declares exactly what it needs (CommonModule, RouterLink, etc.)
+
+ANGULAR SIGNALS:
+  Used in CartService and all components for reactive state.
+  Signals are Angular's replacement for RxJS Subject for local state.
+  They update the DOM automatically without manual subscription management.
+
+
+================================================================================
+8. KEY FEATURES IMPLEMENTATION DETAILS
+================================================================================
+
+PRODUCT TAXONOMY (4-level hierarchy):
+  ProductType → Category → SubCategory → Product
+
+  Browsing uses TypeORM's leftJoinAndSelect to load all 4 levels in one query:
+    .leftJoinAndSelect('product.subCategory', 'subCategory')
+    .leftJoinAndSelect('subCategory.category', 'category')
+    .leftJoinAndSelect('category.productType', 'productType')
+
+  Filtering is done server-side — the Angular filtering component sends
+  query parameters, the backend applies .andWhere() conditions.
+
+FULL-TEXT SEARCH:
+  LIKE operator searches both name and description:
+    .andWhere('(product.name LIKE :term OR product.description LIKE :term)', { term })
+  
+  where term = '%table%'. This finds products in ANY category that match
+  the keyword — Electronics AND Furniture AND Stationery simultaneously.
+
+PAGINATION:
+  GET /api/products?page=2&limit=12
+  Backend calculates: skip = (page-1) * limit
+  Returns: { products, total, page, limit, totalPages }
+  Frontend shows numbered page buttons and Prev/Next.
+
+PERSISTENT CART:
+  CartItems are stored in the database (not localStorage).
+  When a customer logs in, their cart is loaded from DB.
+  If they log out and log back in, cart is still there.
+  Cart is only cleared after successful checkout.
+
+PRICE SNAPSHOT:
+  When an order is placed, OrderItem stores:
+    priceAtPurchase: item.product.price  ← copied at checkout time
+    productName: item.product.name       ← copied at checkout time
+  
+  Even if the admin changes the price next week, or deletes the product,
+  the order history shows the exact price paid.
+
+IMAGE HANDLING:
+  Admin uploads image → multer saves to /ProductImages/filename.jpg
+  DB stores only the filename string: "1234567-89.jpg"
+  express.static('/ProductImages') serves files from that folder
+  Angular constructs URL: /ProductImages/${imagePath}
+  If imagePath is null → show /assets/placeholder.png
+
+IMMEDIATE ACCOUNT LOCK:
+  Admin calls PATCH /api/admin/customers/:id/lock with { locked: true }
+  Backend: user.isLocked = true saved to DB
+  Backend: sessionStore.deleteAllForUser(userId) — removes from Map
+  Customer's next request: passport reads session → not found → 401
+  Angular catches 401 → redirects to login
+  The lock takes effect on the very next API call, not just on next login.
+
+
+================================================================================
+9. ALTERNATIVES CONSIDERED
+================================================================================
+
+INSTEAD OF better-sqlite3, could use:
+  - PostgreSQL: production-grade, supports full-text search natively, JSONB
+    columns, concurrent writes. Requires a running DB server.
+  - MySQL: widely used in industry, slightly different SQL syntax
+  - sql.js: SQLite compiled to WebAssembly, runs entirely in memory (original
+    cookies project used this). No persistence across restarts.
+  - MongoDB: document-based, no schema enforcement, flexible but loses
+    relational benefits (JOINs, foreign keys, ACID transactions)
+
+INSTEAD OF JWT + Cookie, could use:
+  - express-session with a database-backed store (redis, PostgreSQL)
+  - Session-only auth (no JWT, just a session ID in cookie)
+  - OAuth2 / OpenID Connect (social login via Google, GitHub)
+
+INSTEAD OF in-memory session store, could use:
+  - Redis: distributed, survives server restarts, supports TTL natively
+  - Database-backed session: PostgreSQL/MySQL sessions table
+  The Map store is simple and fast but loses all sessions if the server restarts.
+
+INSTEAD OF Passport.js, could use:
+  - Manual JWT verification with jsonwebtoken directly in middleware
+  - express-jwt library
+  Passport adds abstraction and makes it easy to add multiple strategies later.
+
+INSTEAD OF multer for file upload, could use:
+  - AWS S3 / Cloudinary: store images in cloud, not on server disk
+  - Base64 encoding in DB (not recommended — bloats DB size)
+  multer is simple and appropriate for a course project.
+
+INSTEAD OF Angular signals, could use:
+  - RxJS BehaviorSubject (traditional Angular approach)
+  - NgRx store (Redux pattern for complex state)
+  Signals are simpler for component-level state.
+
+INSTEAD OF express-rate-limit, could use:
+  - Nginx rate limiting at the proxy level
+  - Redis-backed rate limiting for distributed systems
+  express-rate-limit is IP-based and works in memory — sufficient for single-server.
+
+
+================================================================================
+10. INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: What is the difference between authentication and authorization?
+A: Authentication verifies WHO you are (login with email/password).
+   Authorization verifies WHAT you are allowed to do (admin vs customer).
+   In this project: JWT + bcrypt handle authentication.
+   requireAdmin/requireCustomer middleware handle authorization (RBAC).
+
+Q2: Why is bcrypt better than MD5 or SHA256 for passwords?
+A: MD5 and SHA256 are fast hashing algorithms designed for data integrity,
+   not passwords. An attacker can compute billions of MD5 hashes per second.
+   bcrypt is deliberately slow (cost factor controls iterations). It also
+   automatically salts each password, so two users with the same password
+   have completely different hashes. Rainbow table attacks are impossible.
+
+Q3: What is XSS and how does storing JWT in an HTTP-only cookie prevent it?
+A: XSS (Cross-Site Scripting) is when an attacker injects malicious JavaScript
+   into a page. If a JWT is stored in localStorage, that script can read it
+   with document.cookie or localStorage.getItem() and steal the token.
+   HTTP-only cookies cannot be read by JavaScript at all — the browser
+   never exposes them to scripts. Only HTTP requests include them.
+
+Q4: What is CSRF and how does SameSite cookie attribute help?
+A: CSRF (Cross-Site Request Forgery) tricks a user's browser into making a
+   request to your API from a malicious third-party site. Cookies are
+   automatically sent with cross-site requests by default.
+   SameSite: 'strict' tells the browser to NEVER send the cookie with
+   cross-origin requests, defeating CSRF entirely.
+
+Q5: What is SQL injection and how does TypeORM QueryBuilder prevent it?
+A: SQL injection is when user input is inserted directly into SQL strings:
+     SELECT * FROM users WHERE name = '" + userInput + "'
+   If userInput = "' OR '1'='1", the query returns all users.
+   TypeORM QueryBuilder uses parameterized queries:
+     .where('user.name = :name', { name: userInput })
+   The driver escapes the value before inserting it. No injection possible.
+
+Q6: Why does an order store priceAtPurchase instead of just a product reference?
+A: Products can change price over time. If an order only stores the product ID
+   and you later look up the price, you'd see the CURRENT price, not what
+   the customer actually paid. This violates the historical record.
+   priceAtPurchase is a snapshot copied at checkout time. Even if the product
+   is deleted, the order history remains accurate and complete.
+
+Q7: What is the difference between a route, controller, and service in this project?
+A: Route: Defines which URL + HTTP method maps to which handler. Pure configuration.
+   Controller: Handles the HTTP layer — parses request, validates input format,
+               calls the service, sends the HTTP response.
+   Service: Contains business logic and database queries. Has no knowledge of
+            HTTP, requests, or responses. Can be called from multiple places.
+
+Q8: Why is the admin module lazy-loaded in Angular?
+A: Lazy loading means the admin JavaScript bundle is only downloaded when
+   someone actually navigates to /admin. Regular customers never download admin
+   code, which reduces initial bundle size and improves load performance.
+   It also provides a clear module boundary — admin routes are separate from
+   customer routes.
+
+Q9: What are Angular Signals and why use them over RxJS Observables?
+A: Signals are a synchronous reactive primitive introduced in Angular 16.
+   They are simpler than RxJS for local state — no subscribe/unsubscribe,
+   no memory leak risk, and Angular's change detection is signal-aware.
+   Observables (RxJS) are better for async streams like HTTP responses.
+   This project uses both: signals for UI state, Observables for HTTP calls.
+
+Q10: What is the APP_INITIALIZER and why is it used?
+A:  APP_INITIALIZER runs a function before Angular bootstraps the application.
+    In this project it calls /api/auth/me to check if the user has a valid
+    cookie. If yes, the user state is populated before any component renders.
+    This prevents the flash where a logged-in user briefly sees the login
+    page before auth state is restored.
+
+Q11: What are TypeORM decorators and what do they do?
+A:  Decorators are metadata annotations that TypeORM reads at runtime to
+    understand the DB schema. @Entity() creates a table. @Column() defines a
+    column. @PrimaryGeneratedColumn() creates an auto-increment primary key.
+    @ManyToOne() / @OneToMany() define foreign key relationships.
+    They require experimentalDecorators: true and emitDecoratorMetadata: true
+    in tsconfig.json, and import 'reflect-metadata' at app entry point.
+
+Q12: How does the in-memory session store work and what are its limitations?
+A:  The session store is a plain JavaScript Map<string, SessionInfo> held in
+    the Node.js process memory. On every protected request, the jti from the
+    JWT payload is looked up in the Map. If found, the session is valid.
+    
+    Limitations:
+    - All sessions are lost if the server restarts
+    - Does not scale to multiple server instances (each server has its own Map)
+    - Memory grows with active sessions (no automatic cleanup for expired tokens)
+    
+    Production solution: Redis — an in-memory key-value store that is external
+    to the app, survives restarts, and can be shared across server instances.
+
+Q13: What is RBAC and how is it implemented here?
+A:  RBAC = Role-Based Access Control. Users are assigned roles (admin, customer)
+    and access to resources is granted based on those roles.
+    Implementation:
+    - User.role column stores 'admin' or 'customer'
+    - JWT payload includes role: user.role
+    - requireAdmin middleware checks req.user.role === 'admin'
+    - requireCustomer checks req.user.role === 'customer'
+    - Angular route guards (adminGuard, customerGuard) prevent UI access
+    - Both layers must be secured — frontend guards alone are NOT sufficient
+      because API calls can be made directly with curl or Postman.
+
+Q14: Why use TypeScript instead of plain JavaScript?
+A:  TypeScript adds static typing which catches errors at compile time rather
+    than runtime. Benefits in this project:
+    - Entity properties are typed — wrong column types caught immediately
+    - Service function signatures are explicit — callers know what to pass
+    - Angular components have typed service injections
+    - Refactoring is safer — TypeScript shows all places affected by a change
+    - better-sqlite3 type errors (like missing column types) are caught early
+
+Q15: What is the difference between synchronize: true and migrations in TypeORM?
+A:  synchronize: true automatically alters the DB schema to match entities
+    every time the app starts. This is convenient for development but DANGEROUS
+    in production — it can drop columns or tables with real data.
+    
+    Migrations are versioned SQL scripts that make schema changes in a controlled,
+    reversible way. You run them manually and they are tracked in a migrations table.
+    Production should always use migrations. This project uses synchronize: true
+    because it is a course/development project with no production data at risk.
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
